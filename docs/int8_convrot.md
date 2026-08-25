@@ -86,12 +86,12 @@ The packed runtime activation tensor contains the I8 activation rows and their f
 ## Backend support
 
 - CPU provides the portable regular Hadamard, activation quantization, INT8 matrix multiplication, and scale restoration implementations.
-- NVIDIA CUDA devices with compute capability 7.5 or newer use the native accelerated path. For H256, CUDA fuses the rotation, row-wise maximum reduction, and activation quantization. It uses cuBLAS for I8 x I8 to I32 GEMM and a CUDA kernel for scale restoration and bias addition.
-- Vulkan and other GPU backends do not currently have dedicated INT8 convrot kernels. They use the backend scheduler to fall back to CPU, which is expected to be substantially slower than the CUDA path.
+- NVIDIA CUDA devices with compute capability 7.5 or newer and AMD HIP (ROCm) devices with RDNA3, RDNA4, or CDNA class GPUs use the native accelerated path. For H256, CUDA and HIP fuse the rotation, row-wise maximum reduction, and activation quantization. They use cuBLAS or hipBLAS for I8 x I8 to I32 GEMM and a device kernel for scale restoration and bias addition.
+- Vulkan provides dedicated INT8 convrot kernels for group size `256`; H64 and other group sizes use CPU execution there. Backends without dedicated INT8 convrot kernels use the backend scheduler to fall back to CPU, which is expected to be substantially slower than the CUDA path.
 
 LoRA adapters are applied at runtime without modifying the INT8 weights. The INT8 convrot path computes the base linear output, while LoRA, LoHa, LoKr, and raw weight-difference adapters compute their output corrections from the original, unrotated activation and add them to the base output. `--lora-apply-mode auto` selects this path for models containing INT8 tensorwise weights. If `immediately` is requested, sd.cpp falls back to runtime application because merging an adapter would require dequantizing and rotating its weight update, then recalculating the per-row scales and requantizing the result.
 
-The dedicated CUDA convrot activation path currently requires a group size of `256`; other supported group sizes use CPU execution.
+The dedicated CUDA and HIP convrot activation paths accept group sizes `64` and `256`; the Vulkan path currently requires `256`. Other supported group sizes use CPU execution.
 
 ## Example
 
