@@ -34,6 +34,10 @@
         - Wan2.2 I2V A14B
             - safetensors: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/tree/main/split_files/diffusion_models
             - gguf: https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF/tree/main
+        - Wan2.2 S2V 14B
+            - safetensors: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/tree/main/split_files/diffusion_models
+            - gguf: https://huggingface.co/QuantStack/Wan2.2-S2V-14B-GGUF/tree/main
+            - int8_convrot safetensors: https://huggingface.co/noctrex/Wan2.2-S2V-14B-int8_convrot
 - Download vae
     - wan_2.1_vae (for all the wan model except Wan2.2 TI2V 5B)
         - safetensors: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors
@@ -48,6 +52,9 @@
 
 - Download clip_vison_h (for Wan2.1 I2V/FLF2V only)
     - safetensors: https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/clip_vision/clip_vision_h.safetensors
+
+- Download audio_encoder (for Wan2.2 S2V only)
+    - safetensors: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/blob/main/split_files/audio_encoders/wav2vec2_large_english_fp16.safetensors
 
 
 ## Examples
@@ -93,6 +100,66 @@
 ```
 
 <video src=../assets/wan/Wan2.2_14B_i2v.mp4 controls="controls" muted="muted" type="video/mp4"></video>
+
+### Wan2.2 S2V 14B
+
+Audio-driven video (speech-to-video). The reference image (`-i`) is the speaker
+portrait, `--audio` is the driving audio track and `--audio-encoder` is the
+wav2vec2 audio encoder. Wan2.2 S2V requires the wan_2.1 vae (16 channel), not
+the wan2.2 vae.
+
+```
+.\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\wan2.2_s2v-14B-Q8_0.gguf --audio-encoder ..\models\audio_encoders\wav2vec2_large_english_fp16.safetensors --vae ..\models\vae\wan_2.1_vae.safetensors --t5xxl ..\models\text_encoders\umt5-xxl-encoder-Q8_0.gguf  -p "a person is talking" --cfg-scale 6.0 --steps 20 --sampling-method euler -v -n "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走" -W 832 -H 480 --diffusion-fa --offload-to-cpu --vae-tiling --video-frames 81 -i ..\assets\cat_with_sd_cpp_42.png --audio .\input\speech.wav --flow-shift 3.0
+```
+
+Notes:
+
+- Recommended settings: `--sampling-method euler --steps 20 --cfg-scale 6.0`.
+  `dpm++2m` produces heavy artifacts on S2V. 4 steps with the lightning LoRA
+  (below) is the fast option.
+- Resolutions: width and height must be multiples of 16; the examples use
+  multiples of 64. 832x480 is a fast starting point; generation cost scales
+  with pixel area.
+- Use `--diffusion-fa` together with `--offload-to-cpu --vae-tiling`. Without
+  flash attention the S2V attention compute buffer alone needs ~40 GB VRAM at
+  480x832; `--offload-to-cpu` keeps the model weights in system RAM, and
+  `--vae-tiling` keeps the video VAE decode (77-81 frames) within VRAM.
+- `--audio` accepts a WAV file; it is downmixed to mono and resampled to 16 kHz
+  internally. Audio longer than the video is truncated, video longer than the
+  audio is padded with silence. Pick `--video-frames` to match the audio:
+  roughly `audio_seconds * 16` frames, capped at one chunk (77-81 frames,
+  ~5 s at the model's 16 fps). 33, 77 and 81 map to clean latent frame counts.
+- The output video carries the driving audio track: it is muxed into `.avi`
+  / `.webm` outputs, truncated to the video duration. Other container types
+  fall back to a `.wav` sidecar file next to the video.
+- Approximate VRAM use at 640x368, 13 frames:
+
+  | checkpoint | VRAM |
+  |------------|------|
+  | wan2.2_s2v_14B_int8_convrot.safetensors | 17.6 GB |
+  | wan2.2_s2v-14B-Q8_0.gguf | 18.4 GB |
+  | wan2.2_s2v-14B-Q4_K_M.gguf | 13.4 GB |
+
+  Q4_K_M is the lowest-memory option; bf16 and fp8_scaled need more than
+  24 GB VRAM.
+- One generation covers the first S2V chunk window (`--video-frames` frames).
+  Long-video chunked extend mode is not implemented yet.
+- Speed: the lightx2v lightning LoRA works with S2V at 4 steps and
+  `--cfg-scale 1.0`. Use the **low_noise** variant;
+  the high_noise variant produces artifacts on S2V:
+
+  ```
+  --lora-model-dir ..\models\loras
+  -p "...<lora:lightx2v-Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0-low_noise:1.0>"
+  --cfg-scale 1.0 --steps 4
+  ```
+
+  Expect some quality/dynamics loss compared to the full 20-step run.
+- fp8_scaled and GGUF checkpoints are supported. The int8_convrot checkpoint
+  is available at
+  https://huggingface.co/noctrex/Wan2.2-S2V-14B-int8_convrot
+  ([int8_convrot](int8_convrot.md)); int8 convrot is supported on the CUDA,
+  Vulkan and ROCm backends.
 
 ### Wan2.2 T2V A14B T2I
 

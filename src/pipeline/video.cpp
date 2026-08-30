@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <optional>
 
+#include "conditioning/audio_processing.hpp"
 #include "core/rng.hpp"
 #include "core/rng_philox.hpp"
 #include "diffusion_engine.h"
@@ -418,6 +419,50 @@ namespace sd::pipeline {
                               static_cast<size_t>(video_channels) * static_cast<size_t>(spatial_size);
         std::copy_n(source, static_cast<size_t>(required), audio.data());
         return audio;
+    }
+
+    // Wan2.2 S2V: build the first per-chunk audio window. Input: wav2vec2 stacked
+    // states [embed_dim, in_frames, num_layers]; output: [embed_dim, batch_frames,
+    // num_layers] as expected by WanDiffusionExtra.audio_embed, frames bucketed at
+    // 16 fps with zero padding past the audio end (nodes_wan.py
+    // get_audio_embed_bucket_fps, m=0, frame_offset=0).
+    static sd::Tensor<float> build_s2v_audio_window(const sd::Tensor<float>& stacked, int64_t batch_frames) {
+        const int64_t embed_dim  = stacked.shape()[0];
+        const int64_t in_frames  = stacked.shape()[1];
+        const int64_t num_layers = stacked.shape()[2];
+        if (embed_dim <= 0 || in_frames <= 0 || num_layers <= 0 || batch_frames <= 0) {
+            return {};
+        }
+        // [embed_dim, in_frames, num_layers] -> layer-first [num_layers, in_frames, embed_dim]
+        std::vector<float> layer_first(static_cast<size_t>(num_layers) * in_frames * embed_dim);
+        for (int64_t l = 0; l < num_layers; ++l) {
+            for (int64_t f = 0; f < in_frames; ++f) {
+                const float* src = stacked.data() + l * embed_dim * in_frames + f * embed_dim;
+                std::copy_n(src,
+                            static_cast<size_t>(embed_dim),
+                            layer_first.data() + (static_cast<size_t>(l) * in_frames + f) * embed_dim);
+            }
+        }
+        AudioProcessing::BucketPlan plan;
+        std::vector<float> buckets = AudioProcessing::build_audio_buckets(layer_first.data(),
+                                                                          static_cast<int>(num_layers),
+                                                                          static_cast<int>(in_frames),
+                                                                          static_cast<int>(embed_dim),
+                                                                          static_cast<int>(batch_frames),
+                                                                          &plan);
+        if (buckets.empty() || plan.bucket_frames < batch_frames) {
+            return {};
+        }
+        // Window rows [0, batch_frames): [frame, num_layers, dim] -> [dim, batch_frames, num_layers]
+        sd::Tensor<float> window({embed_dim, batch_frames, num_layers});
+        for (int64_t f = 0; f < batch_frames; ++f) {
+            for (int64_t l = 0; l < num_layers; ++l) {
+                const float* src = buckets.data() + (static_cast<size_t>(f) * num_layers + l) * embed_dim;
+                float* dst       = window.data() + l * embed_dim * batch_frames + f * embed_dim;
+                std::copy_n(src, static_cast<size_t>(embed_dim), dst);
+            }
+        }
+        return window;
     }
 
     static std::optional<ImageGenerationLatents> prepare_video_generation_latents(StableDiffusionGGML* sd,
@@ -1033,6 +1078,56 @@ namespace sd::pipeline {
             latents.vace_context = sd::ops::concat(vace_context, mask_context, 3);  // [b, 2*c + vae_scale_factor*vae_scale_factor, t + 1 or t, h/vae_scale_factor, w/vae_scale_factor]
             int64_t t2           = ggml_time_ms();
             LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd->diffusion_model->get_desc() == "Wan2.2-S2V-14B") {
+            LOG_INFO("S2V");
+            if (!end_image.empty()) {
+                LOG_WARN("Wan2.2 S2V ignores end_image");
+            }
+            if (sd_vid_gen_params->ref_audios_count > 1) {
+                LOG_ERROR("Wan2.2 S2V supports a single driving audio track");
+                return std::nullopt;
+            }
+            int64_t t1 = ggml_time_ms();
+            if (!start_image.empty()) {
+                // ComfyUI WanSoundImageToVideo: the ref image is VAE-encoded and
+                // appended as reference_latents; the video latent itself stays
+                // unconstrained (no first-frame conditioning).
+                auto ref_img     = start_image.reshape({start_image.shape()[0],
+                                                        start_image.shape()[1],
+                                                        1,
+                                                        start_image.shape()[2],
+                                                        1});
+                auto encoded_ref = sd->encode_first_stage(ref_img);  // [W', H', 1, C, 1]
+                if (encoded_ref.empty()) {
+                    LOG_ERROR("failed to encode S2V reference image");
+                    return std::nullopt;
+                }
+                // forward_orig consumes a 4d reference latent [N*C, t_ref, H, W]
+                latents.ref_latents.push_back(encoded_ref.reshape({encoded_ref.shape()[0],
+                                                                   encoded_ref.shape()[1],
+                                                                   encoded_ref.shape()[2],
+                                                                   encoded_ref.shape()[3]}));
+            }
+            if (sd_vid_gen_params->ref_audios_count == 1) {
+                if (sd->audio_encoder == nullptr) {
+                    LOG_ERROR("S2V audio conditioning requires --audio-encoder (wav2vec2)");
+                    return std::nullopt;
+                }
+                auto stacked = sd->get_audio_embedding(sd_vid_gen_params->ref_audios[0]);
+                if (stacked.empty()) {
+                    LOG_ERROR("failed to compute wav2vec2 embedding for driving audio");
+                    return std::nullopt;
+                }
+                int64_t latent_t        = sd->video_frames_to_latent_frames(request->frames);
+                int64_t batch_frames    = latent_t * 4;
+                latents.s2v_audio_embed = build_s2v_audio_window(stacked, batch_frames);
+                if (latents.s2v_audio_embed.empty()) {
+                    LOG_ERROR("failed to build S2V audio window");
+                    return std::nullopt;
+                }
+            }
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("s2v conditioning prepared, taking %" PRId64 " ms", t2 - t1);
         }
 
         if (latents.init_latent.empty()) {
@@ -1084,6 +1179,15 @@ namespace sd::pipeline {
                     latents.keyframe_indices);
             }
         }
+        if (sd->version == VERSION_WAN2_2_S2V) {
+            // ComfyUI: positive gets the real audio window and the ref latent;
+            // negative gets audio * 0 while KEEPING the same ref latent (wan is
+            // excluded from ref-latent img cfg).
+            embeds.cond.c_ref_images = latents.ref_latents;
+            if (!latents.s2v_audio_embed.empty()) {
+                embeds.cond.c_ref_audios = {latents.s2v_audio_embed};
+            }
+        }
         if (request.use_uncond) {
             condition_params.text  = request.negative_prompt;
             embeds.uncond          = sd->cond_stage_model->get_learned_condition(sd->n_threads,
@@ -1095,6 +1199,12 @@ namespace sd::pipeline {
                 embeds.uncond.c_ref_audios       = latents.reference_audio_latents;
                 embeds.uncond.c_reference_blocks = latents.minimax_reference_blocks;
                 embeds.uncond.c_position_ids     = embeds.cond.c_position_ids;
+            }
+            if (sd->version == VERSION_WAN2_2_S2V) {
+                embeds.uncond.c_ref_images = latents.ref_latents;
+                if (!latents.s2v_audio_embed.empty()) {
+                    embeds.uncond.c_ref_audios = {sd::Tensor<float>::zeros_like(latents.s2v_audio_embed)};
+                }
             }
         }
 
@@ -1725,6 +1835,35 @@ namespace sd::pipeline {
         LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
 
         sd_audio_t* generated_audio = nullptr;
+        if (sd->version == VERSION_WAN2_2_S2V && sd_vid_gen_params->ref_audios_count > 0) {
+            // S2V does not generate audio; the driving track is conditioning only.
+            // Hand a copy back so the output container carries the same audio
+            // (the CLI muxes audio_out into avi/webm).
+            const sd_audio_t& driving = sd_vid_gen_params->ref_audios[0];
+            generated_audio           = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+            if (generated_audio != nullptr) {
+                generated_audio->sample_rate  = driving.sample_rate;
+                generated_audio->channels     = driving.channels;
+                generated_audio->sample_count = driving.sample_count;
+                generated_audio->data         = (float*)malloc(sizeof(float) * driving.sample_count * driving.channels);
+                if (generated_audio->data == nullptr) {
+                    free(generated_audio);
+                    generated_audio = nullptr;
+                } else {
+                    memcpy(generated_audio->data,
+                           driving.data,
+                           sizeof(float) * driving.sample_count * driving.channels);
+                }
+            }
+            if (generated_audio != nullptr) {
+                LOG_DEBUG("s2v output audio: %u Hz, %u channels, %llu samples",
+                          generated_audio->sample_rate,
+                          generated_audio->channels,
+                          (unsigned long long)generated_audio->sample_count);
+            } else {
+                LOG_DEBUG("s2v output audio copy failed (out of memory)");
+            }
+        }
         if ((sd_version_is_ltxav(sd->version) || sd_version_is_minimax_h3(sd->version)) &&
             latents.audio_length > 0 &&
             sd->audio_vae_model != nullptr) {
@@ -1774,6 +1913,7 @@ namespace sd::pipeline {
             return false;
         }
         auto result = decode_video_outputs(sd, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
+        LOG_DEBUG("decode_video_outputs returned %s", result == nullptr ? "nullptr (failed)" : "frames");
         if (result == nullptr) {
             free_sd_audio(generated_audio);
             return false;
@@ -1785,6 +1925,21 @@ namespace sd::pipeline {
         LOG_INFO("generate_video completed in %.2fs", (t1 - t0) * 1.0f / 1000);
         if (frames_out != nullptr) {
             *frames_out = result;
+        }
+        if (sd->version == VERSION_WAN2_2_S2V && generated_audio != nullptr) {
+            // The model conditioned on the first chunk window only; keep the muxed
+            // track aligned with the decoded video duration.
+            int fps               = sd_vid_gen_params->fps > 0 ? sd_vid_gen_params->fps : 16;
+            uint64_t video_frames = num_frames_out != nullptr ? (uint64_t)*num_frames_out : 0;
+            uint64_t want_samples = (uint64_t)((double)video_frames / fps * generated_audio->sample_rate);
+            LOG_DEBUG("s2v audio truncate: %llu samples -> %llu (video %llu frames @ %d fps)",
+                      (unsigned long long)generated_audio->sample_count,
+                      (unsigned long long)want_samples,
+                      (unsigned long long)video_frames,
+                      fps);
+            if (want_samples > 0 && want_samples < generated_audio->sample_count) {
+                generated_audio->sample_count = want_samples;
+            }
         }
         if (audio_out != nullptr) {
             *audio_out = generated_audio;

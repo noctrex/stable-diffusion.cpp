@@ -28,11 +28,13 @@
 #include "model_manager.h"
 #include "stable-diffusion.h"
 
+#include "conditioning/audio_processing.hpp"
 #include "conditioning/conditioner.hpp"
 #include "core/backend_fit.h"
 #include "extensions/generation_extension.h"
 #include "model/adapter/ip_adapter.hpp"
 #include "model/adapter/lora.hpp"
+#include "model/audio/wav2vec2.hpp"
 #include "model/diffusion/animatediff.hpp"
 #include "model/diffusion/control.hpp"
 #include "model/diffusion/model.hpp"
@@ -74,6 +76,7 @@ const char* model_version_to_str[] = {
     "Wan 2.x",
     "Wan 2.2 I2V",
     "Wan 2.2 TI2V",
+    "Wan 2.2 S2V",
     "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
@@ -132,7 +135,7 @@ StableDiffusionGGML::~StableDiffusionGGML() = default;
 
 const std::map<StableDiffusionGGML::RunnerGroup, std::set<ModelComponent>>& StableDiffusionGGML::runner_components() {
     static const std::map<RunnerGroup, std::set<ModelComponent>> components{
-        {RunnerGroup::Core, {ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::CLIPVision, ModelComponent::IPAdapter}},
+        {RunnerGroup::Core, {ModelComponent::Conditioner, ModelComponent::Diffusion, ModelComponent::HighNoiseDiffusion, ModelComponent::CLIPVision, ModelComponent::IPAdapter, ModelComponent::AudioEncoder}},
         {RunnerGroup::VAE, {ModelComponent::VAE, ModelComponent::PreviewVAE, ModelComponent::AudioVAE}},
         {RunnerGroup::ControlNet, {ModelComponent::ControlNet}},
         {RunnerGroup::Extensions, {ModelComponent::PhotoMaker, ModelComponent::PuLID}},
@@ -800,6 +803,13 @@ bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConf
         }
     }
 
+    if (strlen(SAFE_STR(sd_ctx_params->audio_encoder_path)) > 0) {
+        LOG_INFO("loading audio encoder (wav2vec2) from '%s'", sd_ctx_params->audio_encoder_path);
+        if (!model_loader.init_from_file(sd_ctx_params->audio_encoder_path, "wav2vec2.")) {
+            LOG_WARN("loading audio encoder weights from '%s' failed", sd_ctx_params->audio_encoder_path);
+        }
+    }
+
     if (strlen(SAFE_STR(sd_ctx_params->motion_module_path)) > 0) {
         LOG_INFO("loading motion module (AnimateDiff) from '%s'", sd_ctx_params->motion_module_path);
         if (!model_loader.init_from_file(sd_ctx_params->motion_module_path,
@@ -1000,6 +1010,7 @@ bool StableDiffusionGGML::build_core_runners() {
     high_noise_diffusion_model = std::move(runners.high_noise_diffusion);
     clip_vision                = std::move(runners.clip_vision);
     ip_adapter                 = std::move(runners.ip_adapter);
+    audio_encoder              = std::move(runners.audio_encoder);
 
     cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::TE));
     diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
@@ -1009,11 +1020,15 @@ bool StableDiffusionGGML::build_core_runners() {
     if (clip_vision) {
         clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CLIP_VISION));
     }
+    if (audio_encoder) {
+        audio_encoder->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::AUDIO_ENCODER));
+    }
     return register_runner_params(ModelComponent::Conditioner, cond_stage_model, SDBackendModule::TE) &&
            register_runner_params(ModelComponent::Diffusion, diffusion_model, SDBackendModule::DIFFUSION) &&
            register_runner_params(ModelComponent::HighNoiseDiffusion, high_noise_diffusion_model, SDBackendModule::DIFFUSION) &&
            register_runner_params(ModelComponent::CLIPVision, clip_vision, SDBackendModule::CLIP_VISION) &&
-           register_runner_params(ModelComponent::IPAdapter, ip_adapter, SDBackendModule::DIFFUSION);
+           register_runner_params(ModelComponent::IPAdapter, ip_adapter, SDBackendModule::DIFFUSION) &&
+           register_runner_params(ModelComponent::AudioEncoder, audio_encoder, SDBackendModule::AUDIO_ENCODER);
 }
 
 bool StableDiffusionGGML::build_vae_runners() {
@@ -1110,6 +1125,13 @@ bool StableDiffusionGGML::validate_and_load_runners() {
     ignore_tensors.insert("model.diffusion_model.__x0__");
     ignore_tensors.insert("model.diffusion_model.__32x32__");
     ignore_tensors.insert("model.diffusion_model.__index_timestep_zero__");
+
+    if (audio_encoder != nullptr) {
+        // HF wav2vec2 inference leftovers: lm_head is a pretraining head,
+        // masked_spec_embed only applies to masked pretraining.
+        ignore_tensors.insert("wav2vec2.lm_head.");
+        ignore_tensors.insert("wav2vec2.masked_spec_embed");
+    }
 
     if (audio_vae_model) {
         if (!sd_version_is_minimax_h3(version)) {
@@ -1737,6 +1759,30 @@ sd::Tensor<float> StableDiffusionGGML::get_clip_vision_output(const sd::Tensor<f
     return output;
 }
 
+// Driving audio for Wan2.2 S2V: downmix to mono, resample to 16 kHz, then
+// wav2vec2 stacked states [embed_dim, frames, num_layers + 1] at 50 Hz.
+sd::Tensor<float> StableDiffusionGGML::get_audio_embedding(const sd_audio_t& audio) {
+    if (audio_encoder == nullptr) {
+        LOG_ERROR("audio encoder model is not loaded");
+        return {};
+    }
+    if (audio.data == nullptr || audio.sample_count == 0 || audio.channels == 0 || audio.sample_rate == 0) {
+        LOG_ERROR("invalid driving audio");
+        return {};
+    }
+    auto mono = AudioProcessing::downmix_to_mono(audio.data, audio.sample_count, audio.channels);
+    if (mono.empty()) {
+        LOG_ERROR("audio mono downmix failed");
+        return {};
+    }
+    mono = AudioProcessing::resample_audio(mono.data(), mono.size(), audio.sample_rate, 16000);
+    if (mono.empty()) {
+        LOG_ERROR("audio resample to 16 kHz failed");
+        return {};
+    }
+    return audio_encoder->compute(n_threads, mono);
+}
+
 void StableDiffusionGGML::compute_ip_adapter_tokens(const sd_image_t& image, float strength) {
     ip_adapter_tokens        = {};
     ip_adapter_uncond_tokens = {};
@@ -1792,6 +1838,12 @@ std::vector<float> StableDiffusionGGML::process_timesteps(const std::vector<floa
             }
         }
         return new_timesteps;
+    }
+    // Wan2.2 S2V runs per-frame timesteps (ComfyUI repeats t across frames);
+    // reference tokens are zeroed in-model.
+    if (diffusion_model->get_desc() == "Wan2.2-S2V-14B") {
+        int64_t frame_count = init_latent.shape()[2];
+        return std::vector<float>(static_cast<size_t>(frame_count), timesteps[0]);
     } else {
         return timesteps;
     }
@@ -2300,7 +2352,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                                              condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
             } else if (sd_version_is_wan(version)) {
                 diffusion_params.extra = WanDiffusionExtra{vace_context.empty() ? nullptr : &vace_context,
-                                                           vace_strength};
+                                                           vace_strength,
+                                                           condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios[0]};
             } else if (sd_version_is_hunyuan_video(version)) {
                 diffusion_params.extra = HunyuanVideoDiffusionExtra{
                     &guidance_tensor,

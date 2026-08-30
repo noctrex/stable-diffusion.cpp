@@ -207,6 +207,7 @@ typedef struct {
     const char* embeddings_connectors_path;
     const char* vae_path;
     const char* audio_vae_path;
+    const char* audio_encoder_path;
     const char* taesd_path;
     const char* control_net_path;
     const char* ip_adapter_path;

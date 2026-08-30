@@ -1,6 +1,7 @@
 #ifndef __SD_MODEL_DIFFUSION_WAN_HPP__
 #define __SD_MODEL_DIFFUSION_WAN_HPP__
 
+#include <algorithm>
 #include <cinttypes>
 #include <map>
 #include <memory>
@@ -8,6 +9,7 @@
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
 
+#include "model/audio/wav2vec2.hpp"
 #include "model/common/block.hpp"
 #include "model/common/rope.hpp"
 #include "model/diffusion/flux.hpp"
@@ -33,11 +35,17 @@ namespace WAN {
         int vace_layers                        = 0;
         int64_t vace_in_dim                    = 96;
         std::map<int, int> vace_layers_mapping = {};
-        bool qk_norm                           = true;
-        bool cross_attn_norm                   = true;
-        float eps                              = 1e-6f;
-        int64_t flf_pos_embed_token_number     = 0;
-        int theta                              = 10000;
+        // Wan2.2-S2V audio conditioning
+        int64_t audio_dim                       = 1024;  // wav2vec2-large hidden size
+        int num_audio_token                     = 4;     // motion tokens per frame; 1 learned padding token appended at use site
+        std::vector<int> audio_inject_layers    = {};
+        std::map<int, int> audio_inject_mapping = {};  // block index -> injector index
+        std::string adain_mode                  = "attn_norm";
+        bool qk_norm                            = true;
+        bool cross_attn_norm                    = true;
+        float eps                               = 1e-6f;
+        int64_t flf_pos_embed_token_number      = 0;
+        int theta                               = 10000;
         // wan2.1 1.3B: 1536/12, wan2.1/2.2 14B: 5120/40, wan2.2 5B: 3074/24
         std::vector<int> axes_dim = {44, 42, 42};
         int64_t axes_dim_sum      = 128;
@@ -73,6 +81,10 @@ namespace WAN {
                 }
                 if (name.find("img_emb") != std::string::npos) {
                     config.model_type = "i2v";
+                }
+                if (name.find("audio_injector") != std::string::npos || name.find("casual_audio_encoder") != std::string::npos) {
+                    config.model_type          = "s2v";
+                    config.audio_inject_layers = {0, 4, 8, 12, 16, 20, 24, 27, 30, 33, 36, 39};
                 }
                 if (name.find("img_emb.emb_pos") != std::string::npos) {
                     config.flf_pos_embed_token_number = 514;
@@ -528,9 +540,245 @@ namespace WAN {
         }
     };
 
+    //================================================ Wan2.2-S2V audio conditioning =================================================
+    // Ported from ComfyUI comfy/ldm/wan/model.py: CausalConv1d, MotionEncoder_tc,
+    // CausalAudioEncoder and AudioInjector_WAN. Only the adain_mode="attn_norm"
+    // configuration exists in the Wan2.2-S2V-14B checkpoint (injector_pre_norm_*
+    // have no keys), so the pre-norm fallback path is intentionally absent.
+
+    class WanCausalConv1d : public GGMLBlock {
+    protected:
+        int kernel_size;
+
+    public:
+        WanCausalConv1d(int64_t in_dim,
+                        int64_t out_dim,
+                        int kernel_size = 3,
+                        int stride      = 1)
+            : kernel_size(kernel_size) {
+            blocks["conv"] = std::shared_ptr<GGMLBlock>(new Wav2Vec2Conv1d(in_dim, out_dim, kernel_size, stride));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            // x: [T, C] -> [T', C_out]; replicate left-pad (k-1, 0) along T
+            if (kernel_size > 1) {
+                auto first = ggml_ext_slice(ctx->ggml_ctx, x, 0, 0, 1);
+                for (int i = 0; i < kernel_size - 1; i++) {
+                    x = ggml_concat(ctx->ggml_ctx, first, x, 0);
+                }
+            }
+            return std::dynamic_pointer_cast<Wav2Vec2Conv1d>(blocks["conv"])->forward(ctx, x);
+        }
+    };
+
+    class WanMotionEncoder : public GGMLBlock {
+    protected:
+        int64_t hidden_dim;
+        int num_token;
+        bool need_global;
+
+        void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+            // Elementwise-consumed param (ggml_repeat/concat against F32
+            // activations): hardcode F32; the loader converts the storage type.
+            params["padding_tokens"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_dim);
+        }
+
+        // conv -> affine-free LayerNorm over channels -> SiLU. The norm runs on
+        // the permuted [C, T] form; to_conv_layout materializes the [T', C]
+        // form the next conv needs (im2col requires contiguous time rows),
+        // otherwise the token-layout [C, T'] is returned directly.
+        ggml_tensor* conv_norm_silu(GGMLRunnerContext* ctx,
+                                    ggml_tensor* x,
+                                    const std::string& conv_key,
+                                    const std::string& norm_key,
+                                    bool to_conv_layout) {
+            x = std::dynamic_pointer_cast<WanCausalConv1d>(blocks[conv_key])->forward(ctx, x);  // [T', C_out]
+            x = ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3);                                     // [C_out, T']
+            x = std::dynamic_pointer_cast<LayerNorm>(blocks[norm_key])->forward(ctx, x);
+            x = ggml_silu(ctx->ggml_ctx, x);
+            if (to_conv_layout) {
+                x = ggml_ext_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [T', C_out]
+            }
+            return x;
+        }
+
+    public:
+        WanMotionEncoder(int64_t in_dim,
+                         int64_t hidden_dim,
+                         int num_token,
+                         bool need_global = true)
+            : hidden_dim(hidden_dim), num_token(num_token), need_global(need_global) {
+            blocks["conv1_local"] = std::shared_ptr<GGMLBlock>(new WanCausalConv1d(in_dim, hidden_dim / 4 * num_token));
+            if (need_global) {
+                blocks["conv1_global"] = std::shared_ptr<GGMLBlock>(new WanCausalConv1d(in_dim, hidden_dim / 4));
+            }
+            blocks["norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_dim / 4, 1e-6f, false));
+            blocks["conv2"] = std::shared_ptr<GGMLBlock>(new WanCausalConv1d(hidden_dim / 4, hidden_dim / 2, 3, 2));
+            blocks["norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_dim / 2, 1e-6f, false));
+            blocks["conv3"] = std::shared_ptr<GGMLBlock>(new WanCausalConv1d(hidden_dim / 2, hidden_dim, 3, 2));
+            blocks["norm3"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_dim, 1e-6f, false));
+            if (need_global) {
+                blocks["final_linear"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_dim, hidden_dim));
+            }
+        }
+
+        // x: [T, in_dim]. Returns (local [dim, num_token+1, T/4], global [dim, T/4]);
+        // torch groups the conv1_local channels into num_token batches and the
+        // group index becomes the per-frame token index.
+        std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto local = std::dynamic_pointer_cast<WanCausalConv1d>(blocks["conv1_local"])->forward(ctx, x);  // [T, hidden]
+            auto norm1 = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            std::vector<ggml_tensor*> tokens;
+            for (auto& group : ggml_ext_chunk(ctx->ggml_ctx, local, num_token, 1)) {
+                // rearrange 'b (n c) t -> (b n) t c': per-group norm over c
+                ggml_tensor* s = ggml_permute(ctx->ggml_ctx, group, 1, 0, 2, 3);  // [C, T] view
+                s              = norm1->forward(ctx, s);
+                s              = ggml_silu(ctx->ggml_ctx, s);
+                s              = ggml_ext_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, s, 1, 0, 2, 3));  // [T, C]
+                s              = conv_norm_silu(ctx, s, "conv2", "norm2", true);                            // [T2, hidden/2]
+                s              = conv_norm_silu(ctx, s, "conv3", "norm3", false);                           // [hidden, T3]
+                tokens.push_back(ggml_reshape_3d(ctx->ggml_ctx, s, s->ne[0], 1, s->ne[1]));                 // [dim, 1, T3]
+            }
+            auto padding = ggml_reshape_3d(ctx->ggml_ctx, params["padding_tokens"], hidden_dim, 1, 1);
+            padding      = ggml_repeat(ctx->ggml_ctx, padding, tokens[0]);  // [dim, 1, T3]
+            tokens.push_back(padding);
+            ggml_tensor* local_out = ggml_ext_vec_concat(ctx->ggml_ctx, tokens, 1);  // [dim, num_token+1, T3]
+
+            if (!need_global) {
+                return {local_out, nullptr};
+            }
+            // global branch shares conv2/conv3/norms with the local branch
+            ggml_tensor* g = conv_norm_silu(ctx, x, "conv1_global", "norm1", true);  // [T, hidden/4]
+            g              = conv_norm_silu(ctx, g, "conv2", "norm2", true);         // [T2, hidden/2]
+            g              = conv_norm_silu(ctx, g, "conv3", "norm3", false);        // [hidden, T3]
+            g              = std::dynamic_pointer_cast<Linear>(blocks["final_linear"])->forward(ctx, g);
+            return {local_out, g};
+        }
+    };
+
+    class WanCausalAudioEncoder : public GGMLBlock {
+    protected:
+        int64_t audio_dim;
+        int64_t dim;
+        int num_token;
+        int num_layers;
+
+        void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+            // Elementwise-consumed param (silu/mul/div in forward): hardcode F32;
+            // the loader converts the storage type. Checkpoint shape is [1, 25,
+            // 1, 1] (torch order, leading 1s), so the reversed storage ne is
+            // [1, 1, 25, 1]; mirror it for raw-bytes loading. forward reshapes
+            // to [1, 1, L] either way.
+            auto it = tensor_storage_map.find(prefix + "weights");
+            if (it != tensor_storage_map.end()) {
+                params["weights"] = ggml_new_tensor(ctx, GGML_TYPE_F32, it->second.n_dims, it->second.ne);
+            } else {
+                params["weights"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_layers);
+            }
+        }
+
+    public:
+        WanCausalAudioEncoder(int64_t audio_dim,
+                              int64_t dim,
+                              int num_token,
+                              int num_layers = 25)
+            : audio_dim(audio_dim), dim(dim), num_token(num_token), num_layers(num_layers) {
+            blocks["encoder"] = std::shared_ptr<GGMLBlock>(new WanMotionEncoder(audio_dim, dim, num_token, true));
+        }
+
+        // features: [audio_dim, T*4, num_layers] stacked wav2vec2 hidden states.
+        // SiLU-weighted sum over the layer axis, then MotionEncoder.
+        // Returns (local [dim, num_token+1, T], global [dim, T]).
+        std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx, ggml_tensor* features) {
+            auto weights = ggml_silu(ctx->ggml_ctx, params["weights"]);  // [L]
+            auto x       = ggml_mul(ctx->ggml_ctx, features, ggml_reshape_3d(ctx->ggml_ctx, weights, 1, 1, num_layers));
+            x            = ggml_div(ctx->ggml_ctx, x, ggml_sum(ctx->ggml_ctx, weights));
+            // reduce over the layer axis: layers -> ne0 for sum_rows
+            // (torch-style 3-cycle; plain ggml_permute axes are destinations,
+            // the inverse mapping - see the pos_conv weight-norm bug)
+            x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 2, 0, 1, 3));  // [L, dim, F]
+            x = ggml_sum_rows(ctx->ggml_ctx, x);                                                     // [1, dim, F]
+            x = ggml_reshape_2d(ctx->ggml_ctx, x, x->ne[1], x->ne[2]);                               // [dim, F]
+            x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [F, dim]
+            return std::dynamic_pointer_cast<WanMotionEncoder>(blocks["encoder"])->forward(ctx, x);
+        }
+    };
+
+    class WanAudioInjector : public GGMLBlock {
+    protected:
+        int64_t dim;
+
+    public:
+        WanAudioInjector(int64_t dim,
+                         int64_t num_heads,
+                         int count,
+                         bool qk_norm = true,
+                         float eps    = 1e-6f)
+            : dim(dim) {
+            for (int i = 0; i < count; i++) {
+                blocks["injector." + std::to_string(i)] =
+                    std::shared_ptr<GGMLBlock>(new WanT2VCrossAttention(dim, num_heads, qk_norm, eps));
+                blocks["injector_adain_layers." + std::to_string(i) + ".linear"] =
+                    std::shared_ptr<GGMLBlock>(new Linear(dim, dim * 2));
+            }
+            // AdaLayerNorm norm is affine-free (no checkpoint keys); eps 1e-5 per
+            // upstream AdaLayerNorm, distinct from the model-wide 1e-6.
+            blocks["adain_norm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(dim, 1e-5f, false));
+        }
+
+        // x: [dim, n_token] full sequence; audio_local: [dim, num_token+1, T];
+        // audio_global: [dim, T]. The residual is applied to the first seq_len
+        // (video) tokens only; trailing reference tokens pass through unchanged.
+        // Batching over T at ne[2] mirrors torch's rearrange to (b t) n c.
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             int64_t seq_len,
+                             int64_t T,
+                             int injector_id,
+                             ggml_tensor* audio_local,
+                             ggml_tensor* audio_global) {
+            int64_t n_tok   = seq_len / T;
+            int64_t n_token = x->ne[1];
+
+            auto adain_linear = std::dynamic_pointer_cast<Linear>(blocks["injector_adain_layers." + std::to_string(injector_id) + ".linear"]);
+            auto injector     = std::dynamic_pointer_cast<WanT2VCrossAttention>(blocks["injector." + std::to_string(injector_id)]);
+            auto adain_norm   = std::dynamic_pointer_cast<LayerNorm>(blocks["adain_norm"]);
+
+            auto temb  = ggml_silu(ctx->ggml_ctx, audio_global);                // [dim, T]
+            temb       = adain_linear->forward(ctx, temb);                      // [2*dim, T]
+            auto shift = ggml_ext_slice(ctx->ggml_ctx, temb, 0, 0, dim);        // [dim, T]
+            auto scale = ggml_ext_slice(ctx->ggml_ctx, temb, 0, dim, dim * 2);  // [dim, T]
+            shift      = ggml_reshape_3d(ctx->ggml_ctx, shift, dim, 1, T);
+            scale      = ggml_reshape_3d(ctx->ggml_ctx, scale, dim, 1, T);
+
+            auto x_vid = ggml_ext_slice(ctx->ggml_ctx, x, 1, 0, seq_len);       // [dim, seq_len] view
+            auto h     = ggml_reshape_3d(ctx->ggml_ctx, x_vid, dim, n_tok, T);  // [dim, n_tok, T]
+            h          = adain_norm->forward(ctx, h);
+            h          = ggml_add(ctx->ggml_ctx, h, ggml_mul(ctx->ggml_ctx, h, scale));  // h * (1 + scale)
+            h          = ggml_add(ctx->ggml_ctx, h, shift);
+
+            auto res = injector->forward(ctx, h, audio_local, 0);  // [dim, n_tok, T]
+            res      = ggml_reshape_2d(ctx->ggml_ctx, res, dim, seq_len);
+
+            auto x_head = ggml_add(ctx->ggml_ctx, x_vid, res);  // out-of-place add on the view
+            if (seq_len < n_token) {
+                auto x_tail = ggml_ext_slice(ctx->ggml_ctx, x, 1, seq_len, n_token);
+                return ggml_concat(ctx->ggml_ctx, x_head, x_tail, 1);
+            }
+            return x_head;
+        }
+    };
+
     class Wan : public GGMLBlock {
     protected:
         WanConfig config;
+
+        void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+            if (config.model_type == "s2v") {
+                enum ggml_type wtype                 = GGML_TYPE_F32;  // elementwise add vs F32 activations
+                params["trainable_cond_mask.weight"] = ggml_new_tensor_2d(ctx, wtype, config.dim, 3);
+            }
+        }
 
     public:
         Wan() {}
@@ -554,7 +802,7 @@ namespace WAN {
 
             // blocks
             for (int i = 0; i < config.num_layers; i++) {
-                auto block                            = std::shared_ptr<GGMLBlock>(new WanAttentionBlock(config.model_type == "t2v",
+                auto block                            = std::shared_ptr<GGMLBlock>(new WanAttentionBlock(config.model_type != "i2v",
                                                                                                          config.dim,
                                                                                                          config.ffn_dim,
                                                                                                          config.num_heads,
@@ -594,6 +842,15 @@ namespace WAN {
                 }
 
                 blocks["vace_patch_embedding"] = std::shared_ptr<GGMLBlock>(new Conv3d(config.vace_in_dim, config.dim, config.patch_size, config.patch_size));
+            }
+
+            // s2v audio conditioning (checkpoint-contained modules)
+            if (config.model_type == "s2v") {
+                blocks["casual_audio_encoder"] = std::shared_ptr<GGMLBlock>(new WanCausalAudioEncoder(config.audio_dim, config.dim, config.num_audio_token));
+                blocks["audio_injector"]       = std::shared_ptr<GGMLBlock>(new WanAudioInjector(config.dim, config.num_heads, (int)config.audio_inject_layers.size(), config.qk_norm, config.eps));
+                for (size_t i = 0; i < config.audio_inject_layers.size(); i++) {
+                    config.audio_inject_mapping[config.audio_inject_layers[i]] = (int)i;
+                }
             }
         }
 
@@ -642,17 +899,23 @@ namespace WAN {
                                   ggml_tensor* timestep,
                                   ggml_tensor* context,
                                   ggml_tensor* pe,
-                                  ggml_tensor* clip_fea     = nullptr,
-                                  ggml_tensor* vace_context = nullptr,
-                                  float vace_strength       = 1.f,
-                                  int64_t N                 = 1) {
+                                  ggml_tensor* clip_fea         = nullptr,
+                                  ggml_tensor* vace_context     = nullptr,
+                                  float vace_strength           = 1.f,
+                                  int64_t N                     = 1,
+                                  ggml_tensor* audio_embed      = nullptr,
+                                  ggml_tensor* reference_latent = nullptr) {
             // x: [N*C, T, H, W], C => in_dim
             // vace_context: [N*vace_in_dim, T, H, W]
             // timestep: [N,] or [T]
             // context: [N, L, text_dim]
-            // return: [N, t_len*h_len*w_len, out_dim*pt*ph*pw]
+            // audio_embed: [audio_dim, T*4, 25] stacked wav2vec2 hidden states (S2V)
+            // reference_latent: [N*C, T_ref, H, W] (S2V)
+            // return: [N, (t_len [+ t_ref_len]) * h_len*w_len, out_dim*pt*ph*pw]
 
             GGML_ASSERT(N == 1);
+
+            int64_t T = x->ne[2];
 
             auto patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
 
@@ -669,6 +932,41 @@ namespace WAN {
             x = patch_embedding->forward(ctx, x);                                                    // [N*dim, t_len, h_len, w_len]
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
+
+            // s2v: audio conditioning + reference latent append
+            ggml_tensor* audio_local  = nullptr;
+            ggml_tensor* audio_global = nullptr;
+            int64_t seq_len           = x->ne[1];
+            int64_t t_ref_len         = 0;
+            if (config.model_type == "s2v") {
+                if (audio_embed != nullptr) {
+                    GGML_ASSERT(audio_embed->ne[1] == T * 4);  // one pixel-frame per latent frame * 4
+                    auto audio_encoder = std::dynamic_pointer_cast<WanCausalAudioEncoder>(blocks["casual_audio_encoder"]);
+                    auto audio_emb     = audio_encoder->forward(ctx, audio_embed);
+                    audio_local        = audio_emb.first;   // [dim, num_audio_token+1, T]
+                    audio_global       = audio_emb.second;  // [dim, T]
+                    GGML_ASSERT(audio_local->ne[2] == T);
+                }
+
+                // video tokens get cond_mask[0], reference tokens cond_mask[1]
+                auto cond_mask = params["trainable_cond_mask.weight"];  // [dim, 3]
+                auto cm0       = ggml_reshape_3d(ctx->ggml_ctx, ggml_ext_slice(ctx->ggml_ctx, cond_mask, 1, 0, 1), config.dim, 1, 1);
+                x              = ggml_add(ctx->ggml_ctx, x, cm0);
+
+                if (reference_latent != nullptr) {
+                    t_ref_len = reference_latent->ne[2];
+                    auto ref  = patch_embedding->forward(ctx, reference_latent);  // [N*dim, t_ref_len, h_len, w_len]
+                    ref       = ggml_reshape_3d(ctx->ggml_ctx, ref, ref->ne[0] * ref->ne[1] * ref->ne[2], ref->ne[3] / N, N);
+                    ref       = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, ref, 1, 0, 2, 3));  // [N, t_ref*h_len*w_len, dim]
+                    auto cm1  = ggml_reshape_3d(ctx->ggml_ctx, ggml_ext_slice(ctx->ggml_ctx, cond_mask, 1, 1, 2), config.dim, 1, 1);
+                    ref       = ggml_add(ctx->ggml_ctx, ref, cm1);
+                    x         = ggml_concat(ctx->ggml_ctx, x, ref, 1);
+
+                    // reference frames run at timestep 0 (upstream t concat with zeros)
+                    GGML_ASSERT(timestep->ne[0] == T);
+                    timestep = ggml_ext_pad(ctx->ggml_ctx, timestep, (int)t_ref_len, 0, 0, 0);
+                }
+            }
 
             // time_embedding
             auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
@@ -714,6 +1012,11 @@ namespace WAN {
 
             auto x_orig = x;
 
+            std::shared_ptr<WanAudioInjector> audio_injector;
+            if (audio_local != nullptr) {
+                audio_injector = std::dynamic_pointer_cast<WanAudioInjector>(blocks["audio_injector"]);
+            }
+
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
 
@@ -731,6 +1034,15 @@ namespace WAN {
                     c_skip      = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
                     x           = ggml_add(ctx->ggml_ctx, x, c_skip);
                 }
+
+                // s2v: AdaIN from the global audio token, then cross-attention
+                // against the per-frame audio tokens; residual on video tokens only
+                if (audio_injector != nullptr) {
+                    auto inject_iter = config.audio_inject_mapping.find(i);
+                    if (inject_iter != config.audio_inject_mapping.end()) {
+                        x = audio_injector->forward(ctx, x, seq_len, T, inject_iter->second, audio_local, audio_global);
+                    }
+                }
                 sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");
                 if (c != nullptr) {
                     sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
@@ -747,11 +1059,13 @@ namespace WAN {
                              ggml_tensor* timestep,
                              ggml_tensor* context,
                              ggml_tensor* pe,
-                             ggml_tensor* clip_fea        = nullptr,
-                             ggml_tensor* time_dim_concat = nullptr,
-                             ggml_tensor* vace_context    = nullptr,
-                             float vace_strength          = 1.f,
-                             int64_t N                    = 1) {
+                             ggml_tensor* clip_fea         = nullptr,
+                             ggml_tensor* time_dim_concat  = nullptr,
+                             ggml_tensor* vace_context     = nullptr,
+                             float vace_strength           = 1.f,
+                             int64_t N                     = 1,
+                             ggml_tensor* audio_embed      = nullptr,
+                             ggml_tensor* reference_latent = nullptr) {
             // Forward pass of DiT.
             // x: [N*C, T, H, W]
             // timestep: [N,]
@@ -779,7 +1093,12 @@ namespace WAN {
                 t_len           = ((x->ne[2] + (std::get<0>(config.patch_size) / 2)) / std::get<0>(config.patch_size));
             }
 
-            auto out = forward_orig(ctx, x, timestep, context, pe, clip_fea, vace_context, vace_strength, N);  // [N, t_len*h_len*w_len, pt*ph*pw*C]
+            auto out = forward_orig(ctx, x, timestep, context, pe, clip_fea, vace_context, vace_strength, N, audio_embed, reference_latent);  // [N, (t_len [+t_ref]) *h_len*w_len, pt*ph*pw*C]
+
+            if (reference_latent != nullptr) {
+                // drop the trailing reference tokens (upstream unpatchify slices to prod(grid_sizes))
+                out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, t_len * h_len * w_len);
+            }
 
             out = unpatchify(ctx->ggml_ctx, out, t_len, h_len, w_len);  // [N*C, (T+pad_t) + (T2+pad_t2), H + pad_h, W + pad_w]
 
@@ -839,7 +1158,10 @@ namespace WAN {
                     config.text_len  = 512;
                 }
             } else if (config.num_layers == 40) {
-                if (config.model_type == "t2v") {
+                if (version == VERSION_WAN2_2_S2V) {
+                    desc          = "Wan2.2-S2V-14B";
+                    config.in_dim = 16;
+                } else if (config.model_type == "t2v") {
                     if (version == VERSION_WAN2_2_I2V) {
                         desc          = "Wan2.2-I2V-14B";
                         config.in_dim = 36;
@@ -891,7 +1213,9 @@ namespace WAN {
                                  const sd::Tensor<float>& c_concat_tensor        = {},
                                  const sd::Tensor<float>& time_dim_concat_tensor = {},
                                  const sd::Tensor<float>& vace_context_tensor    = {},
-                                 float vace_strength                             = 1.f) {
+                                 float vace_strength                             = 1.f,
+                                 const sd::Tensor<float>& audio_embed_tensor     = {},
+                                 const sd::Tensor<float>& ref_latent_tensor      = {}) {
             ggml_cgraph* gf = new_graph_custom(WAN_GRAPH_SIZE);
 
             ggml_tensor* x               = make_input(x_tensor);
@@ -901,16 +1225,33 @@ namespace WAN {
             ggml_tensor* c_concat        = make_optional_input(c_concat_tensor);
             ggml_tensor* time_dim_concat = make_optional_input(time_dim_concat_tensor);
             ggml_tensor* vace_context    = make_optional_input(vace_context_tensor);
+            ggml_tensor* audio_embed     = make_optional_input(audio_embed_tensor);
+            ggml_tensor* ref_latent      = make_optional_input(ref_latent_tensor);
 
-            pe_vec      = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
-                                           static_cast<int>(x->ne[1]),
-                                           static_cast<int>(x->ne[0]),
-                                           std::get<0>(config.patch_size),
-                                           std::get<1>(config.patch_size),
-                                           std::get<2>(config.patch_size),
-                                           1,
-                                           config.theta,
-                                           config.axes_dim);
+            pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
+                                      static_cast<int>(x->ne[1]),
+                                      static_cast<int>(x->ne[0]),
+                                      std::get<0>(config.patch_size),
+                                      std::get<1>(config.patch_size),
+                                      std::get<2>(config.patch_size),
+                                      1,
+                                      config.theta,
+                                      config.axes_dim);
+            if (ref_latent != nullptr) {
+                // s2v reference latent: temporal offset t_start = max(30, T + 9)
+                int t_start = std::max(30, static_cast<int>(x->ne[2]) + 9);
+                auto ref_pe = Rope::gen_wan_pe(static_cast<int>(ref_latent->ne[2]),
+                                               static_cast<int>(ref_latent->ne[1]),
+                                               static_cast<int>(ref_latent->ne[0]),
+                                               std::get<0>(config.patch_size),
+                                               std::get<1>(config.patch_size),
+                                               std::get<2>(config.patch_size),
+                                               1,
+                                               config.theta,
+                                               config.axes_dim,
+                                               t_start);
+                pe_vec.insert(pe_vec.end(), ref_pe.begin(), ref_pe.end());
+            }
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
             // LOG_VERBOSE("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
@@ -933,7 +1274,10 @@ namespace WAN {
                                            clip_fea,
                                            time_dim_concat,
                                            vace_context,
-                                           vace_strength);
+                                           vace_strength,
+                                           1,
+                                           audio_embed,
+                                           ref_latent);
 
             ggml_build_forward_expand(gf, out);
 
@@ -948,9 +1292,11 @@ namespace WAN {
                                   const sd::Tensor<float>& c_concat        = {},
                                   const sd::Tensor<float>& time_dim_concat = {},
                                   const sd::Tensor<float>& vace_context    = {},
-                                  float vace_strength                      = 1.f) {
+                                  float vace_strength                      = 1.f,
+                                  const sd::Tensor<float>& audio_embed     = {},
+                                  const sd::Tensor<float>& ref_latent      = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength);
+                return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength, audio_embed, ref_latent);
             };
 
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
@@ -961,6 +1307,12 @@ namespace WAN {
             GGML_ASSERT(diffusion_params.x != nullptr);
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
             const auto* extra = diffusion_extra_as<WanDiffusionExtra>(diffusion_params);
+            static const std::vector<sd::Tensor<float>> no_ref_latents;
+            const auto& ref_latents = config.model_type == "s2v" && diffusion_params.ref_latents != nullptr
+                                          ? *diffusion_params.ref_latents
+                                          : no_ref_latents;
+            const sd::Tensor<float> empty_tensor;
+            const sd::Tensor<float>& ref_latent = ref_latents.empty() ? empty_tensor : ref_latents[0];
             return compute(n_threads,
                            *diffusion_params.x,
                            *diffusion_params.timesteps,
@@ -969,7 +1321,9 @@ namespace WAN {
                            tensor_or_empty(diffusion_params.c_concat),
                            sd::Tensor<float>(),
                            tensor_or_empty(extra->vace_context),
-                           extra->vace_strength);
+                           extra->vace_strength,
+                           tensor_or_empty(extra->audio_embed),
+                           ref_latent);
         }
 
         void test() {

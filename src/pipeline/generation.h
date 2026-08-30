@@ -28,6 +28,7 @@ namespace sd::pipeline {
         sd::Tensor<float> denoise_mask;
         sd::Tensor<float> clip_vision_output;
         sd::Tensor<float> vace_context;
+        sd::Tensor<float> s2v_audio_embed;
         int64_t ref_image_num                  = 0;
         int64_t video_conditioning_frame_count = 0;
         int64_t video_target_frame_count       = 0;
