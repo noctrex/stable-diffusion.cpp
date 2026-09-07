@@ -8,6 +8,7 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_graph_cut.h"
+#include "core/util.h"
 #include "ggml-cpu.h"
 #include "ggml/src/ggml-impl.h"
 
@@ -31,7 +32,20 @@ namespace sd {
             return true;
         }
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-            if (!ggml_backend_supports_op(backend_, ggml_graph_node(graph, i))) {
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            if (node != nullptr && !ggml_backend_supports_op(backend_, node)) {
+                LOG_DEBUG("unsupported node %d/%d on backend '%s': op=%s type=%s "
+                          "ne=[%lld,%lld,%lld,%lld] src0=%s[%lld,%lld] src1=%s[%lld,%lld]",
+                          i, ggml_graph_n_nodes(graph), ggml_backend_name(backend_),
+                          ggml_op_name(node->op), ggml_type_name(node->type),
+                          (long long)node->ne[0], (long long)node->ne[1],
+                          (long long)node->ne[2], (long long)node->ne[3],
+                          node->src[0] ? ggml_type_name(node->src[0]->type) : "-",
+                          node->src[0] ? (long long)node->src[0]->ne[0] : -1,
+                          node->src[0] ? (long long)node->src[0]->ne[1] : -1,
+                          node->src[1] ? ggml_type_name(node->src[1]->type) : "-",
+                          node->src[1] ? (long long)node->src[1]->ne[0] : -1,
+                          node->src[1] ? (long long)node->src[1]->ne[1] : -1);
                 return true;
             }
         }
