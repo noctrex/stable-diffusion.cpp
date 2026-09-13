@@ -366,7 +366,7 @@ bool read_safetensors_file(const std::string& file_path,
                     while (gs_remainder > 1 && gs_remainder % 4 == 0) {
                         gs_remainder /= 4;
                     }
-                    // K must fill whole target-type blocks: Q4_0/IQ4_NL block size is 32
+                    // K must fill whole 32-blocks (converter contract), and K % GS == 0
                     if (gs_remainder != 1 || (2 * packed_k) % 32 != 0 || (2 * packed_k) % convrot_gs != 0) {
                         set_error(error, "invalid ComfyUI convrot group size for tensor '" + name + "'");
                         return false;
@@ -419,16 +419,8 @@ bool read_safetensors_file(const std::string& file_path,
             return false;
         }
 
-        // Rewrite packed w4 convrot weights to their converted representation so
-        // param creation, buffer sizing, and the load loop all see the target type.
-        // The reblocked bytes are produced by ModelLoader::convert_w4_tensor_storages.
-        if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
-            const ggml_type target = (tensor_storage.w4_convrot_kind == W4_CONVROT_W4A4) ? GGML_TYPE_Q4_0 : GGML_TYPE_IQ4_NL;
-            tensor_storage.ne[0] *= 2;  // de-pack K/2 -> K
-            tensor_storage.type          = target;
-            tensor_storage.expected_type = target;
-        }
-
+        // Packed w4 convrot weights stay raw: the w4 kernels consume the packed
+        // bytes in place (type I8, ne = [K/2, N] in ggml order). No rewrite.
         tensor_storages.push_back(tensor_storage);
 
         // LOG_VERBOSE("%s %s", tensor_storage.to_string().c_str(), dtype.c_str());

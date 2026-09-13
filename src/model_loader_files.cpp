@@ -41,7 +41,6 @@ bool ModelLoader::file_unchanged(const FileStamp& stamp) {
 void ModelLoader::invalidate_file_data() {
     file_data.clear();
     model_files_processed = false;
-    converted_w4_data_.clear();
 }
 
 void ModelLoader::rebuild_catalog() {
