@@ -96,6 +96,408 @@ void i64_to_i32_vec(int64_t* src, int32_t* dst, int64_t n) {
     }
 }
 
+// Dequantize one row of a packed ComfyUI convrot_w4a4 weight to F32.
+// packed_k bytes hold K = 2*packed_k values: low nibble = even k, high nibble =
+// odd k, two's-complement int4, scaled by the per-row F32 weight_scale.
+static void dequant_w4a4_row(const uint8_t* packed, int64_t packed_k, float row_scale, float* dst) {
+    for (int64_t j = 0; j < packed_k; j++) {
+        const int lo_nib = packed[j] & 0xF;
+        const int hi_nib = packed[j] >> 4;
+        const int lo     = lo_nib < 8 ? lo_nib : lo_nib - 16;
+        const int hi     = hi_nib < 8 ? hi_nib : hi_nib - 16;
+        dst[2 * j]       = lo * row_scale;
+        dst[2 * j + 1]   = hi * row_scale;
+    }
+}
+
+// Dequantize one row of a packed ComfyUI asym_w4a8_int8 weight to F32:
+// w[k] = codebook[code] * s_channel * s_rel[k / group_size], codes unsigned 0-15.
+static void dequant_w4a8_row(const uint8_t* packed,
+                             int64_t packed_k,
+                             const float* codebook,
+                             float s_channel,
+                             const float* s_rel_row,
+                             int s_rel_group_size,
+                             float* dst) {
+    for (int64_t j = 0; j < packed_k; j++) {
+        const int lo   = packed[j] & 0xF;
+        const int hi   = packed[j] >> 4;
+        dst[2 * j]     = codebook[lo] * s_channel * s_rel_row[(2 * j) / s_rel_group_size];
+        dst[2 * j + 1] = codebook[hi] * s_channel * s_rel_row[(2 * j + 1) / s_rel_group_size];
+    }
+}
+
+static bool read_stream_at(std::ifstream& file, size_t offset, char* dst, size_t n) {
+    file.clear();
+    file.seekg((std::streamoff)offset, std::ios::beg);
+    file.read(dst, (std::streamsize)n);
+    return static_cast<bool>(file);
+}
+
+// Disk sidecar cache for reblocked w4 tensors: "<model>.w4reblock".
+// Validated against the source file's size + mtime; any mismatch forces a reconvert.
+static const char W4_CACHE_MAGIC[8] = {'S', 'D', 'W', '4', 'R', 'B', 'C', '1'};
+static constexpr uint32_t W4_CACHE_VERSION = 1;
+
+static bool write_u32(std::ofstream& out, uint32_t v) { return (bool)out.write((const char*)&v, 4); }
+static bool write_u64(std::ofstream& out, uint64_t v) { return (bool)out.write((const char*)&v, 8); }
+static bool read_u32(std::ifstream& in, uint32_t* v) { return (bool)in.read((char*)v, 4); }
+static bool read_u64(std::ifstream& in, uint64_t* v) { return (bool)in.read((char*)v, 8); }
+
+static bool try_load_w4_cache(const std::string& cache_path,
+                              const std::string& model_path,
+                              const std::vector<std::pair<std::string, TensorStorage>>& items,
+                              std::map<std::string, std::vector<char>>& out_map) {
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+    char magic[8];
+    uint32_t version = 0, count = 0, reserved = 0;
+    uint64_t src_size = 0, src_mtime = 0;
+    if (!in.read(magic, 8) || memcmp(magic, W4_CACHE_MAGIC, 8) != 0 || !read_u32(in, &version) ||
+        !read_u32(in, &reserved) || !read_u64(in, &src_size) || !read_u64(in, &src_mtime) || !read_u32(in, &count)) {
+        return false;
+    }
+    if (version != W4_CACHE_VERSION || count != items.size()) {
+        return false;
+    }
+    std::error_code ec;
+    if (std::filesystem::file_size(model_path, ec) != src_size || ec ||
+        std::filesystem::last_write_time(model_path, ec).time_since_epoch().count() != (int64_t)src_mtime || ec) {
+        return false;
+    }
+
+    std::map<std::string, std::vector<char>> loaded;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t name_len = 0;
+        if (!read_u32(in, &name_len) || name_len == 0 || name_len > 4096) {
+            return false;
+        }
+        std::string name(name_len, '\0');
+        if (!in.read(name.data(), name_len)) {
+            return false;
+        }
+        uint32_t kind = 0;
+        uint64_t nbytes = 0;
+        if (!read_u32(in, &kind) || !read_u64(in, &nbytes)) {
+            return false;
+        }
+        const TensorStorage* ts = nullptr;
+        for (const auto& [n, s] : items) {
+            if (n == name) {
+                ts = &s;
+                break;
+            }
+        }
+        if (ts == nullptr || (int)kind != ts->w4_convrot_kind ||
+            nbytes != (uint64_t)ggml_row_size(ts->type == GGML_TYPE_Q4_0 ? GGML_TYPE_Q4_0 : GGML_TYPE_IQ4_NL,
+                                              ts->ne[0]) *
+                ts->ne[1]) {
+            return false;
+        }
+        std::vector<char>& buf = loaded[name];
+        buf.resize(nbytes);
+        if (!in.read(buf.data(), (std::streamsize)nbytes)) {
+            return false;
+        }
+    }
+    out_map = std::move(loaded);
+    return true;
+}
+
+static bool write_w4_cache(const std::string& cache_path,
+                           const std::string& model_path,
+                           const std::vector<std::pair<std::string, TensorStorage>>& items,
+                           const std::map<std::string, std::vector<char>>& data) {
+    std::error_code ec;
+    const uint64_t src_size    = std::filesystem::file_size(model_path, ec);
+    const uint64_t src_mtime   = (uint64_t)std::filesystem::last_write_time(model_path, ec).time_since_epoch().count();
+    const std::string tmp_path = cache_path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::binary);
+        if (!out.is_open()) {
+            return false;
+        }
+        out.write(W4_CACHE_MAGIC, 8);
+        write_u32(out, W4_CACHE_VERSION);
+        write_u32(out, 0);
+        write_u64(out, src_size);
+        write_u64(out, src_mtime);
+        write_u32(out, (uint32_t)items.size());
+        for (const auto& [name, ts] : items) {
+            const auto& buf = data.at(name);
+            write_u32(out, (uint32_t)name.size());
+            out.write(name.data(), (std::streamsize)name.size());
+            write_u32(out, (uint32_t)ts.w4_convrot_kind);
+            write_u64(out, (uint64_t)buf.size());
+            out.write(buf.data(), (std::streamsize)buf.size());
+        }
+        if (!out) {
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp_path, cache_path, ec);
+    return !ec;
+}
+
+const TensorStorage* find_w4_companion(const String2TensorStorage& map,
+                                       const std::string& module_name,
+                                       const char* suffix) {
+    auto it = map.find(module_name + suffix);
+    return it == map.end() ? nullptr : &it->second;
+}
+
+// Converts one packed w4 convrot tensor storage into a ggml-native Q4_0/IQ4_NL buffer.
+// Opens the source file once and services all reads through it; keeps no shared state,
+// so it is safe to run concurrently for different tensors.
+static bool convert_one_w4_tensor(const String2TensorStorage& tensor_storage_map,
+                                  const std::vector<std::string>& file_paths,
+                                  const std::string& name,
+                                  const TensorStorage& ts,
+                                  std::vector<char>& out,
+                                  float* max_err_out,
+                                  float* rel_l2_out,
+                                  std::string& error) {
+    if (ts.index_in_zip >= 0) {
+        error = sd_format("packed w4 convrot weights inside zip archives are not supported: '%s'", name.c_str());
+        return false;
+    }
+    if (ts.file_index >= file_paths.size()) {
+        error = sd_format("missing file for packed w4 convrot weight '%s'", name.c_str());
+        return false;
+    }
+    const bool is_w4a4            = ts.w4_convrot_kind == W4_CONVROT_W4A4;
+    const ggml_type target_type   = is_w4a4 ? GGML_TYPE_Q4_0 : GGML_TYPE_IQ4_NL;
+    const int64_t k               = ts.ne[0];  // de-packed
+    const int64_t n               = ts.ne[1];
+    const int64_t packed_k        = k / 2;
+    const std::string module_name = name.substr(0, name.size() - std::string(".weight").size());
+    const std::string& file_path  = file_paths[ts.file_index];
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file.is_open()) {
+        error = sd_format("failed to open '%s' for packed w4 convrot weight '%s'", file_path.c_str(), name.c_str());
+        return false;
+    }
+
+        // companion storages must live in the same file as the weight
+        const TensorStorage* scale_ts     = nullptr;
+        const TensorStorage* codebook_ts  = nullptr;
+        const TensorStorage* s_channel_ts = nullptr;
+        const TensorStorage* s_rel_ts     = nullptr;
+        if (is_w4a4) {
+            scale_ts = find_w4_companion(tensor_storage_map, module_name, ".weight_scale");
+            if (scale_ts == nullptr || scale_ts->type != GGML_TYPE_F32 || scale_ts->nelements() != n ||
+                scale_ts->file_index != ts.file_index) {
+                error = sd_format("missing or invalid weight_scale for packed w4a4 weight '%s'", name.c_str());
+                return false;
+            }
+        } else {
+            codebook_ts  = find_w4_companion(tensor_storage_map, module_name, ".weight_codebook");
+            s_channel_ts = find_w4_companion(tensor_storage_map, module_name, ".weight_s_channel");
+            s_rel_ts     = find_w4_companion(tensor_storage_map, module_name, ".weight_s_rel");
+            if (codebook_ts == nullptr || codebook_ts->type != GGML_TYPE_F32 || codebook_ts->nelements() != 16 ||
+                codebook_ts->file_index != ts.file_index ||
+                s_channel_ts == nullptr || s_channel_ts->type != GGML_TYPE_F32 || s_channel_ts->nelements() != n ||
+                s_channel_ts->file_index != ts.file_index ||
+                s_rel_ts == nullptr || !s_rel_ts->is_f8_e4m3 || s_rel_ts->n_dims != 2 ||
+                s_rel_ts->ne[0] != k / ts.w4a8_group_size || s_rel_ts->ne[1] != n ||
+                s_rel_ts->file_index != ts.file_index) {
+                error = sd_format("missing or invalid codebook/s_channel/s_rel for packed w4a8 weight '%s'", name.c_str());
+                return false;
+            }
+        }
+
+        // read small companions fully
+        std::vector<float> row_scales(n, 1.0f);
+        std::vector<float> codebook(16, 0.0f);
+        std::vector<float> s_rel_f32;
+        if (is_w4a4) {
+            if (!read_stream_at(file, scale_ts->offset, (char*)row_scales.data(), n * sizeof(float))) {
+                error = sd_format("failed to read weight_scale for packed w4a4 weight '%s'", name.c_str());
+                return false;
+            }
+        } else {
+            const int64_t s_rel_elements = s_rel_ts->nelements();
+            std::vector<uint8_t> s_rel_raw(s_rel_elements);
+            if (!read_stream_at(file, codebook_ts->offset, (char*)codebook.data(), 16 * sizeof(float)) ||
+                !read_stream_at(file, s_channel_ts->offset, (char*)row_scales.data(), n * sizeof(float)) ||
+                !read_stream_at(file, s_rel_ts->offset, (char*)s_rel_raw.data(), s_rel_elements)) {
+                error = sd_format("failed to read companions for packed w4a8 weight '%s'", name.c_str());
+                return false;
+            }
+            s_rel_f32.resize(s_rel_elements);
+            auto f8_traits = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+            f8_traits->to_float(s_rel_raw.data(), s_rel_f32.data(), s_rel_elements);
+        }
+
+        // dequant + requant in row chunks to bound transient memory
+        const int64_t out_row_bytes = ggml_row_size(target_type, k);
+        out.resize(out_row_bytes * n);
+        const int64_t row_chunk = std::max<int64_t>(1, (4 * 1024 * 1024) / (k * (int64_t)sizeof(float)));
+        std::vector<float> f32((size_t)k * row_chunk);
+        std::vector<uint8_t> packed((size_t)packed_k * row_chunk);
+        std::vector<float> imatrix(k, 1.0f);
+        // reblock fidelity stats: requantized rows dequantized back vs source
+        float max_err = 0.f, sum_sq_err = 0.f, sum_sq_ref = 0.f;
+        for (int64_t row0 = 0; row0 < n; row0 += row_chunk) {
+            const int64_t rows      = std::min(row_chunk, n - row0);
+            const size_t read_start = ts.offset + (size_t)(row0 * packed_k);
+            if (!read_stream_at(file, read_start, (char*)packed.data(), (size_t)(rows * packed_k))) {
+                error = sd_format("failed to read packed weight data for '%s'", name.c_str());
+                return false;
+            }
+            for (int64_t r = 0; r < rows; r++) {
+                float* dst_row         = f32.data() + (size_t)r * k;
+                const uint8_t* src_row = packed.data() + (size_t)r * packed_k;
+                if (is_w4a4) {
+                    dequant_w4a4_row(src_row, packed_k, row_scales[row0 + r], dst_row);
+                } else {
+                    dequant_w4a8_row(src_row,
+                                     packed_k,
+                                     codebook.data(),
+                                     row_scales[row0 + r],
+                                     s_rel_f32.data() + (size_t)(row0 + r) * (k / ts.w4a8_group_size),
+                                     ts.w4a8_group_size,
+                                     dst_row);
+                }
+            }
+            ggml_quantize_chunk(target_type,
+                                f32.data(),
+                                out.data() + (size_t)(row0 * out_row_bytes),
+                                0,
+                                (int)rows,
+                                (int)k,
+                                imatrix.data());
+            {
+                std::vector<float> back((size_t)rows * k);
+                auto traits = ggml_get_type_traits(target_type);
+                traits->to_float(out.data() + (size_t)(row0 * out_row_bytes), back.data(), rows * k);
+                for (int64_t i = 0; i < rows * k; i++) {
+                    const float diff = back[i] - f32[i];
+                    max_err          = std::max(max_err, std::fabs(diff));
+                    sum_sq_err += diff * diff;
+                    sum_sq_ref += f32[i] * f32[i];
+                }
+            }
+        }
+    *max_err_out = max_err;
+    *rel_l2_out  = std::sqrt(sum_sq_err) / (std::sqrt(sum_sq_ref) + 1e-9f);
+    return true;
+}
+
+bool ModelLoader::convert_w4_tensor_storages() {
+    converted_w4_data_.clear();
+    const int64_t t0 = ggml_time_ms();
+    // snapshot the tensors to convert; remember whether they all live in one file,
+    // which is the precondition for the per-model disk sidecar cache
+    std::vector<std::pair<std::string, TensorStorage>> items;
+    std::string single_source;
+    bool single_file = true;
+    for (const auto& [name, ts] : tensor_storage_map) {
+        if (ts.w4_convrot_kind == W4_CONVROT_NONE || is_unused_tensor(name)) {
+            continue;
+        }
+        if (ts.file_index >= file_paths_.size()) {
+            LOG_ERROR("missing file for packed w4 convrot weight '%s'", name.c_str());
+            return false;
+        }
+        const std::string& path = file_paths_[ts.file_index];
+        if (single_source.empty()) {
+            single_source = path;
+        } else if (single_source != path) {
+            single_file = false;
+        }
+        items.emplace_back(name, ts);
+    }
+    if (items.empty()) {
+        return true;
+    }
+    std::string cache_path;
+    if (single_file) {
+        cache_path = single_source + ".w4reblock";
+        if (try_load_w4_cache(cache_path, single_source, items, converted_w4_data_)) {
+            uint64_t cached_bytes = 0;
+            for (const auto& [n, buf] : converted_w4_data_) {
+                cached_bytes += buf.size();
+            }
+            LOG_INFO("loaded %zu reblocked w4 tensors (%.2f MB) from cache '%s', taking %.2fs",
+                     items.size(),
+                     cached_bytes / (1024.0 * 1024.0),
+                     cache_path.c_str(),
+                     (ggml_time_ms() - t0) / 1000.f);
+            return true;
+        }
+    }
+    std::atomic<size_t> next_idx(0);
+    std::atomic<bool> any_failed(false);
+    std::mutex result_mutex;
+    std::map<std::string, std::vector<char>> results;
+    std::vector<std::string> stat_lines;
+    std::string first_error;
+    auto worker = [&]() {
+        while (!any_failed.load(std::memory_order_relaxed)) {
+            const size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= items.size()) {
+                break;
+            }
+            const auto& [name, ts] = items[i];
+            std::vector<char> out;
+            float max_err = 0.f, rel_l2 = 0.f;
+            std::string error;
+            if (!convert_one_w4_tensor(tensor_storage_map, file_paths_, name, ts, out, &max_err, &rel_l2, error)) {
+                std::lock_guard<std::mutex> lock(result_mutex);
+                if (first_error.empty()) {
+                    first_error = error;
+                }
+                any_failed.store(true);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(result_mutex);
+            stat_lines.push_back(sd_format("reblocked '%s': max |diff| = %.5f, rel L2 = %.5f",
+                                           name.c_str(),
+                                           max_err,
+                                           rel_l2));
+            results.emplace(name, std::move(out));
+        }
+    };
+    const int n_threads = std::max(1, std::min<int>(n_threads_, (int)items.size()));
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; t++) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    if (any_failed.load()) {
+        LOG_ERROR("%s", first_error.c_str());
+        return false;
+    }
+    uint64_t converted_bytes = 0;
+    for (auto& [name, buf] : results) {
+        converted_bytes += buf.size();
+        converted_w4_data_.emplace(name, std::move(buf));
+    }
+    for (const auto& line : stat_lines) {
+        LOG_VERBOSE("%s", line.c_str());
+    }
+    const bool cached = !cache_path.empty() && write_w4_cache(cache_path, single_source, items, results);
+    if (!cache_path.empty()) {
+        if (cached) {
+            LOG_VERBOSE("wrote reblock cache '%s'", cache_path.c_str());
+        } else {
+            LOG_WARN("failed to write reblock cache '%s' (will reconvert on next load)", cache_path.c_str());
+        }
+    }
+    LOG_INFO("reblocked %zu packed w4 convrot tensors (%.2f MB) on %d threads, taking %.2fs",
+             items.size(),
+             converted_bytes / (1024.0 * 1024.0),
+             n_threads,
+             (ggml_time_ms() - t0) / 1000.f);
+    return true;
+}
+
 void convert_tensor(void* src,
                     ggml_type src_type,
                     void* dst,
@@ -796,6 +1198,10 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
     tensor_type_rules_ = tensor_type_rules;
     auto map_rules     = parse_tensor_type_rules(tensor_type_rules);
     for (auto& [name, tensor_storage] : tensor_storage_map) {
+        if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
+            // target type is intrinsic to the packed format, not subject to overrides
+            continue;
+        }
         tensor_storage.expected_type = GGML_TYPE_COUNT;
         ggml_type dst_type           = wtype;
         for (const auto& tensor_type_rule : map_rules) {
@@ -820,6 +1226,11 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
 void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
     if (model_files_processed) {
         return;
+    }
+
+    if (!convert_w4_tensor_storages()) {
+        converted_w4_data_.clear();
+        throw std::runtime_error("failed to reblock packed w4 convrot tensors");
     }
 
     std::vector<TensorStorage> processed_tensor_storages;
@@ -938,6 +1349,11 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
 
             size_t tensor_size   = tensor_storage.nbytes();
             size_t tensor_offset = tensor_storage.offset;
+
+            if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
+                // raw file bytes are packed; reblocked bytes are injected by load_tensors
+                continue;
+            }
 
             if (tensor_storage.ne[0] != dst_tensor->ne[0] ||
                 tensor_storage.ne[1] != dst_tensor->ne[1] ||
@@ -1208,8 +1624,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         }
                     }
 
-                    t0 = ggml_time_ms();
-                    if (!read_data(read_buf, nbytes_to_read)) {
+                    t0                      = ggml_time_ms();
+                    const auto converted_w4 = converted_w4_data_.find(tensor_storage.name);
+                    if (converted_w4 != converted_w4_data_.end()) {
+                        // reblocked bytes were produced in memory; skip file I/O
+                        GGML_ASSERT((size_t)nbytes_to_read == converted_w4->second.size());
+                        memcpy(read_buf, converted_w4->second.data(), nbytes_to_read);
+                    } else if (!read_data(read_buf, nbytes_to_read)) {
                         failed = true;
                         break;
                     }
@@ -1511,7 +1932,15 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
     if (tensor_storage.is_int8_tensorwise) {
         return false;
     }
-    if (type != GGML_TYPE_COUNT) {
+    // Packed ComfyUI w4 convrot weights are reblocked to Q4_0/IQ4_NL by the loader
+    // itself; never route them through the generic conversion machinery.
+    if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
+        return false;
+    }
+    if (ends_with(name, ".weight_codebook") || ends_with(name, ".weight_s_rel") ||
+        ends_with(name, ".weight_s_channel")) {
+        // Pass, do not convert (w4 convrot companions)
+    } else if (type != GGML_TYPE_COUNT) {
         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
             // Pass, do not convert
         } else if (ends_with(name, ".bias")) {

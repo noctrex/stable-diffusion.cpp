@@ -146,6 +146,14 @@ public:
 
     bool tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) const;
     int64_t get_params_mem_size(ggml_backend_t backend, ggml_type type = GGML_TYPE_COUNT) const;
+
+private:
+    // Produces reblocked Q4_0/IQ4_NL bytes for packed ComfyUI w4 convrot weights.
+    // Called from process_model_files; results are injected at tensor read time.
+    bool convert_w4_tensor_storages();
+    std::map<std::string, std::vector<char>> converted_w4_data_;
+
+public:
     ~ModelLoader() = default;
 };
 

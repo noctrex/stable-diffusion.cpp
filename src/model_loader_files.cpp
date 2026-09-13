@@ -41,6 +41,7 @@ bool ModelLoader::file_unchanged(const FileStamp& stamp) {
 void ModelLoader::invalidate_file_data() {
     file_data.clear();
     model_files_processed = false;
+    converted_w4_data_.clear();
 }
 
 void ModelLoader::rebuild_catalog() {
@@ -147,7 +148,12 @@ bool ModelLoader::add_file_impl(const std::string& path, const std::string& pref
         }
         if (tensor.index_in_zip < 0) {
             const auto& stamp = physical_files[tensor.file_index];
-            if (tensor.offset > stamp.size || elements / block_size * type_size > stamp.size - tensor.offset) {
+            // packed w4 convrot weights are rewritten to their converted representation;
+            // the on-disk region is the packed I8 payload (half the element count)
+            const uint64_t on_disk_bytes = tensor.w4_convrot_kind != W4_CONVROT_NONE
+                                               ? elements / 2
+                                               : elements / block_size * type_size;
+            if (tensor.offset > stamp.size || on_disk_bytes > stamp.size - tensor.offset) {
                 LOG_ERROR("tensor '%s' extends beyond its model file", tensor.name.c_str());
                 return false;
             }
