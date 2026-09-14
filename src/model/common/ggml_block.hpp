@@ -354,13 +354,17 @@ public:
             if (ctx->weight_adapter && b != nullptr) {
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
             }
-            const auto cache_key = std::make_pair(x, w4_convrot_group_size);
-            auto cached          = ctx->int8_convrot_cache.find(cache_key);
-            if (cached == ctx->int8_convrot_cache.end()) {
-                x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, w4_convrot_group_size);
-                ctx->int8_convrot_cache.emplace(cache_key, x);
-            } else {
-                x = cached->second;
+            // quantize only at unit scale: with scale != 1 the wrapper
+            // pre-scales the F32 input and the w4 kernels quantize inline
+            if (scale == 1.f) {
+                const auto cache_key = std::make_pair(x, w4_convrot_group_size);
+                auto cached          = ctx->int8_convrot_cache.find(cache_key);
+                if (cached == ctx->int8_convrot_cache.end()) {
+                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, w4_convrot_group_size);
+                    ctx->int8_convrot_cache.emplace(cache_key, x);
+                } else {
+                    x = cached->second;
+                }
             }
             ggml_tensor* weight_scales = nullptr;
             ggml_tensor* s_channel     = nullptr;
