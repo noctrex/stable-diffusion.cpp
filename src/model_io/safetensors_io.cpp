@@ -378,21 +378,9 @@ bool read_safetensors_file(const std::string& file_path,
                             set_error(error, "invalid asym_w4a8_int8 group size for tensor '" + name + "'");
                             return false;
                         }
-                        // s_rel is word-transposed at load (uint words of 4 F8
-                        // bytes per group-of-4); needs whole words per row
-                        if ((2 * packed_k) % 64 != 0) {
-                            set_error(error, "asym_w4a8_int8 requires K % 64 == 0 for tensor '" + name + "'");
-                            return false;
-                        }
                         tensor_storage.w4a8_group_size = config->second.w4a8_group_size;
                     }
                 }
-            }
-        } else if (ends_with(name, ".weight_s_rel")) {
-            const std::string module_name = name.substr(0, name.size() - std::string(".weight_s_rel").size());
-            auto config                   = comfy_quant_configs.find(module_name);
-            if (config != comfy_quant_configs.end() && config->second.format == "asym_w4a8_int8") {
-                tensor_storage.w4_s_rel_repack = true;
             }
         } else if (ends_with(name, ".weight_scale")) {
             const std::string module_name = name.substr(0, name.size() - std::string(".weight_scale").size());
