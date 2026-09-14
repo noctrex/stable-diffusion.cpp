@@ -96,6 +96,30 @@ void i64_to_i32_vec(int64_t* src, int32_t* dst, int64_t n) {
     }
 }
 
+// Packed-w4 repack: transpose the [ocol][pw] element grid (file / ggml
+// row-major order) into [pw][ocol] so the w4 kernels' global loads are fully
+// coalesced (a warp covers consecutive outputs in one transaction instead of
+// striding across rows, 8 B used per 32 B sector). Pure element permutation,
+// same byte count; tensor shapes are unchanged. elem_size is 4: packed
+// weight words and s_rel uint words (4 F8 bytes per group-of-4). Blocked to
+// stay cache-friendly on GB-scale tensors.
+static void repack_w4_convrot(const void* src, void* dst, int64_t rows, int64_t cols, size_t elem_size) {
+    constexpr int64_t TS = 64;
+    for (int64_t c0 = 0; c0 < cols; c0 += TS) {
+        const int64_t c1 = std::min(c0 + TS, cols);
+        for (int64_t r0 = 0; r0 < rows; r0 += TS) {
+            const int64_t r1 = std::min(r0 + TS, rows);
+            for (int64_t c = c0; c < c1; ++c) {
+                for (int64_t r = r0; r < r1; ++r) {
+                    memcpy((char*)dst + (c * rows + r) * elem_size,
+                           (const char*)src + (r * cols + c) * elem_size,
+                           elem_size);
+                }
+            }
+        }
+    }
+}
+
 void convert_tensor(void* src,
                     ggml_type src_type,
                     void* dst,
@@ -934,6 +958,12 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
             if (dst_tensor == nullptr)
                 continue;
 
+            if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE || tensor_storage.w4_s_rel_repack) {
+                // packed-w4 payloads are word-transposed at load; they cannot
+                // alias the read-only mmap
+                continue;
+            }
+
             if (tensor_storage.is_f64 ||
                 tensor_storage.is_i64 ||
                 tensor_storage.type != dst_tensor->type) {
@@ -1185,8 +1215,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     char* read_buf    = nullptr;
                     char* target_buf  = nullptr;
                     char* convert_buf = nullptr;
+                    // packed-w4 payloads transpose at load; they always read
+                    // through scratch, never straight into the destination
+                    const bool w4_repack = tensor_storage.w4_convrot_kind != W4_CONVROT_NONE ||
+                                           tensor_storage.w4_s_rel_repack;
                     if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
-                        if (tensor_storage.type == dst_tensor->type) {
+                        if (tensor_storage.type == dst_tensor->type && !w4_repack) {
                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
                             if (tensor_storage.is_f64 || tensor_storage.is_i64) {
                                 read_buffer.resize(tensor_storage.nbytes_to_read());
@@ -1206,7 +1240,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         read_buf   = (char*)read_buffer.data();
                         target_buf = read_buf;
 
-                        if (tensor_storage.type != dst_tensor->type) {
+                        if (tensor_storage.type != dst_tensor->type || w4_repack) {
                             convert_buffer.resize(ggml_nbytes(dst_tensor));
                             convert_buf = (char*)convert_buffer.data();
                         }
@@ -1221,12 +1255,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     read_time_ms.fetch_add(t1 - t0);
 
                     t0 = ggml_time_ms();
-                    if (tensor_storage.is_f64) {
+                    if (w4_repack) {
+                        // [ocol][pw] -> [pw][ocol], uint words: packed weight
+                        // words (ne[0] = packed_k bytes) and s_rel words
+                        // (ne[0] = K/16 bytes) both pack 4 bytes per element
+                        repack_w4_convrot(read_buf, convert_buf, dst_tensor->ne[1], dst_tensor->ne[0] / 4, 4);
+                    } else if (tensor_storage.is_f64) {
                         f64_to_f32_vec((double*)read_buf, (float*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_i64) {
                         i64_to_i32_vec((int64_t*)read_buf, (int32_t*)target_buf, tensor_storage.nelements());
                     }
-                    if (tensor_storage.type != dst_tensor->type) {
+                    if (!w4_repack && tensor_storage.type != dst_tensor->type) {
                         if (convert_buf == nullptr) {
                             LOG_ERROR("read tensor data failed: too less memory for conversion");
                             failed = true;
@@ -1241,7 +1280,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                        (int)tensor_storage.nelements() / (int)tensor_storage.ne[0],
                                        (int)tensor_storage.ne[0],
                                        std::move(imatrix));
-                    } else {
+                    } else if (!w4_repack) {
                         convert_buf = read_buf;
                     }
                     t1 = ggml_time_ms();

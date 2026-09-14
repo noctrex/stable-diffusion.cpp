@@ -36,6 +36,7 @@ struct TensorStorage {
     int w4_convrot_kind         = W4_CONVROT_NONE;
     int w4_convrot_group_size   = 0;
     int w4a8_group_size         = 0;
+    bool w4_s_rel_repack        = false;  // asym_w4a8_int8 s_rel: word-transposed at load
     int64_t ne[SD_MAX_DIMS]     = {1, 1, 1, 1, 1};
     int n_dims                  = 0;
 

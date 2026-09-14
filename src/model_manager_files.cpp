@@ -14,7 +14,7 @@ static bool same_tensor_source(const TensorStorage& a, const TensorStorage& b) {
            a.is_int8_tensorwise == b.is_int8_tensorwise && a.int8_convrot == b.int8_convrot &&
            a.int8_convrot_group_size == b.int8_convrot_group_size &&
            a.w4_convrot_kind == b.w4_convrot_kind && a.w4_convrot_group_size == b.w4_convrot_group_size &&
-           a.w4a8_group_size == b.w4a8_group_size;
+           a.w4a8_group_size == b.w4a8_group_size && a.w4_s_rel_repack == b.w4_s_rel_repack;
 }
 
 void ModelManager::invalidate_sources(const std::unordered_set<TensorState*>& states) {
